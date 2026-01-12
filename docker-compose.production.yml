@@ -1,0 +1,301 @@
+# =============================================================================
+# AICSL 生产环境 Docker Compose 配置
+# =============================================================================
+# 使用方法:
+#   1. 复制 .env.production.example 为 .env.production
+#   2. 填写所有必要的环境变量
+#   3. 运行: docker-compose -f docker-compose.production.yml --env-file .env.production up -d
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # 数据库服务
+  # ===========================================================================
+  mongodb:
+    image: mongo:7.0
+    container_name: aicsl-mongodb
+    restart: always
+    ports:
+      - "127.0.0.1:27017:27017" # 仅本地访问
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+      - MONGO_INITDB_DATABASE=aicsl
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - aicsl-network
+    command: [ "--auth", "--bind_ip_all" ]
+    healthcheck:
+      test: |
+        mongosh --username ${MONGO_ROOT_USERNAME} --password ${MONGO_ROOT_PASSWORD} --authenticationDatabase admin --eval "db.adminCommand('ping')" --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ===========================================================================
+  # 缓存服务
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aicsl-redis
+    restart: always
+    ports:
+      - "127.0.0.1:6379:6379" # 仅本地访问
+    volumes:
+      - redis_data:/data
+    networks:
+      - aicsl-network
+    command: >
+      redis-server  --appendonly yes  --maxmemory 512mb  --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ===========================================================================
+  # 对象存储服务
+  # ===========================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: aicsl-minio
+    restart: always
+    ports:
+      - "127.0.0.1:9000:9000" # S3 API (仅本地)
+      - "127.0.0.1:9001:9001" # Console (仅本地)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - aicsl-network
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "30m"
+        max-file: "3"
+
+  # ===========================================================================
+  # 后端 API 服务
+  # ===========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    image: aicsl-backend:${APP_VERSION:-latest}
+    container_name: aicsl-backend
+    restart: always
+    expose:
+      - "8000" # 仅通过 Nginx 暴露
+    environment:
+      # 应用配置
+      - APP_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SECRET_KEY=${SECRET_KEY}
+
+      # 数据库
+      - MONGODB_URI=mongodb://${MONGO_APP_USERNAME}:${MONGO_APP_PASSWORD}@mongodb:27017/${MONGODB_DB_NAME}?authSource=aicsl
+      - MONGODB_DB_NAME=${MONGODB_DB_NAME:-aicsl}
+      - MONGODB_MAX_POOL_SIZE=${MONGODB_MAX_POOL_SIZE:-20}
+
+      # 缓存
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+
+      # 存储
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_PUBLIC_ENDPOINT=${DOMAIN_NAME}/storage
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-aicsl-files}
+      - MINIO_USE_SSL=false
+
+      # 认证
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+
+      # AI 配置
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+
+      # CORS
+      - CORS_ORIGINS=["https://${DOMAIN_NAME}"]
+
+      # HuggingFace cache for RAG embedding models
+      - HF_HOME=/app/data/hf_cache
+      - TRANSFORMERS_CACHE=/app/data/hf_cache
+      - HUGGINGFACE_HUB_CACHE=/app/data/hf_cache
+    volumes:
+      - hf_cache:/app/data/hf_cache
+    networks:
+      - aicsl-network
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://127.0.0.1:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    # 生产环境: 使用 gunicorn + uvicorn workers
+    command: >
+      gunicorn app.main:app  --workers ${BACKEND_WORKERS:-4} --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 120 --keep-alive 5 --access-logfile - --error-logfile -
+
+  # ===========================================================================
+  # 前端服务
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+      args:
+        - VITE_API_BASE_URL=https://${DOMAIN_NAME}/api
+    image: aicsl-frontend:${APP_VERSION:-latest}
+    container_name: aicsl-frontend
+    restart: always
+    expose:
+      - "80" # 仅通过 Nginx 暴露
+    networks:
+      - aicsl-network
+    depends_on:
+      - backend
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ===========================================================================
+  # 反向代理 & SSL 终结
+  # ===========================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: aicsl-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.production.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/logs:/var/log/nginx
+    networks:
+      - aicsl-network
+    depends_on:
+      - backend
+      - frontend
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+# =============================================================================
+# 持久化卷
+# =============================================================================
+volumes:
+  mongodb_data:
+    driver: local
+  mongodb_config:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  hf_cache:
+    driver: local
+
+# =============================================================================
+# 网络配置
+# =============================================================================
+networks:
+  aicsl-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
