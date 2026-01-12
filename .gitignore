@@ -69,3 +69,9 @@ docker-compose.override.yml
 *.tmp
 *.temp
 
+# HuggingFace / ML model cache (large files)
+backend/data/hf_cache/
+hf_cache/
+*.onnx
+*.bin
+*.safetensors
